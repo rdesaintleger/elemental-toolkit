@@ -62,10 +62,8 @@ ARG KBD=2.6.4
 RUN curl -L https://mirrors.edge.kernel.org/pub/linux/utils/kbd/kbd-${KBD}.tar.xz --output kbd-${KBD}.tar.xz && \
     tar xaf kbd-${KBD}.tar.xz && mkdir -p /usr/share/keymaps && cp -Rp kbd-${KBD}/data/keymaps/* /usr/share/keymaps/
 
-# Symlink grub2-editenv and snapper global config
-RUN mkdir -p /etc/sysconfig && \
-    ln -sf //etc/default/snapper /etc/sysconfig/snapper && \
-    ln -sf /usr/bin/grub-editenv /usr/bin/grub2-editenv
+# Symlink grub2-editenv
+RUN ln -sf /usr/bin/grub-editenv /usr/bin/grub2-editenv
 
 # Just add the elemental cli
 COPY --from=toolkit /usr/bin/elemental /usr/bin/elemental
