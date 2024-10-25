@@ -50,15 +50,16 @@ const (
 var _ types.Snapshotter = (*Btrfs)(nil)
 
 type Btrfs struct {
-	cfg              types.Config
-	snapshotterCfg   types.SnapshotterConfig
-	btrfsCfg         types.BtrfsConfig
-	rootDir          string
-	snapshotsDir     string
-	stateDir         string
-	efiDir           string
-	activeSnapshotID int
-	bootloader       types.Bootloader
+	cfg               types.Config
+	snapshotterCfg    types.SnapshotterConfig
+	btrfsCfg          types.BtrfsConfig
+	rootDir           string
+	snapshotsDir      string
+	stateDir          string
+	efiDir            string
+	currentSnapshotID int
+	activeSnapshotID  int
+	bootloader        types.Bootloader
 }
 
 type btrfsSubvol struct {
@@ -103,6 +104,7 @@ func (b *Btrfs) InitSnapshotter(state *types.Partition, efiDir string) error {
 	var ok bool
 
 	b.cfg.Logger.Infof("Initiate btrfs snapshotter at %s", state.MountPoint)
+	b.currentSnapshotID = 0
 	b.stateDir = state.MountPoint
 	b.efiDir = efiDir
 
@@ -113,7 +115,7 @@ func (b *Btrfs) InitSnapshotter(state *types.Partition, efiDir string) error {
 			return b.configureMountPointAndRootDir(state)
 		}
 	} else if err != nil {
-		b.cfg.Logger.Errorf("failed loading initial snapshotter state: %v")
+		b.cfg.Logger.Errorf("failed loading initial snapshotter state: %v", err)
 		return err
 	} else {
 		b.cfg.Logger.Debug("Running initial btrfs configuration")
@@ -441,6 +443,11 @@ func (b *Btrfs) DeleteSnapshot(id int) error {
 
 	if b.activeSnapshotID == id {
 		err := fmt.Errorf("active snapshot can't be deleted")
+		return err
+	}
+
+	if b.currentSnapshotID == id {
+		err := fmt.Errorf("current snapshot can't be deleted")
 		return err
 	}
 
@@ -967,7 +974,7 @@ func (b *Btrfs) findStateMount(path string) (topDir string, rootDir string, snap
 		}
 	}
 
-	r := regexp.MustCompile(`^@/\.snapshots/\d+/snapshot$`)
+	r := regexp.MustCompile(`^@/\.snapshots/(\d+)/snapshot$`)
 	snapshotsSubvol := filepath.Join(rootSubvol, snapshotsPath)
 
 	// second pass over parsed findmnt lines. search each mounted subvolume of interest.
@@ -996,9 +1003,12 @@ func (b *Btrfs) findStateMount(path string) (topDir string, rootDir string, snap
 				stateDir = lineFields[1]
 			} else if subVolume == snapshotsSubvol {
 				snapshotsDir = lineFields[1]
-			} else if r.MatchString(subVolume) && lineFields[1] == "/" {
+			} else if matches := r.FindStringSubmatch(subVolume); matches != nil && lineFields[1] == "/" {
 				// only define rootDir if mounted as '/'
 				rootDirMatches = append(rootDirMatches, lineFields[1])
+
+				// save snapshot ID as current ID
+				b.currentSnapshotID, _ = strconv.Atoi(matches[1])
 			}
 		}
 	}
