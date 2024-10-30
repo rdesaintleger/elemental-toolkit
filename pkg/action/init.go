@@ -18,6 +18,7 @@ package action
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/rancher/elemental-toolkit/v2/pkg/constants"
@@ -69,18 +70,16 @@ func RunInit(cfg *types.RunConfig, spec *types.InitSpec) error {
 	if kernel != constants.KernelPath {
 		cfg.Config.Logger.Debugf("Creating kernel symlink from %s to %s", kernel, constants.KernelPath)
 		_ = cfg.Fs.Remove(constants.KernelPath)
-		err = cfg.Fs.Symlink(kernel, constants.KernelPath)
+		relKernel, err := filepath.Rel(filepath.Dir(constants.KernelPath), kernel)
+		if err != nil {
+			cfg.Config.Logger.Errorf("could set a relative path from '%s' to '%s': %v", constants.KernelPath, kernel, err)
+			return err
+		}
+		err = cfg.Fs.Symlink(relKernel, constants.KernelPath)
 		if err != nil {
 			cfg.Config.Logger.Errorf("failed creating kernel symlink")
 			return err
 		}
-	}
-
-	// ensure kernel link is relativized if applicable
-	err = utils.RelativizeLink(cfg.Fs, constants.KernelPath)
-	if err != nil {
-		cfg.Config.Logger.Errorf("failed relativizing kernel symlink")
-		return err
 	}
 
 	cfg.Config.Logger.Info("Remove any pre-existing initrd")
@@ -106,15 +105,15 @@ func RunInit(cfg *types.RunConfig, spec *types.InitSpec) error {
 
 	cfg.Config.Logger.Debugf("Creating initrd symlink from %s to %s", initrd, constants.InitrdPath)
 	_ = cfg.Fs.Remove(constants.InitrdPath)
-	err = cfg.Fs.Symlink(initrd, constants.InitrdPath)
+	relInitrd, err := filepath.Rel(filepath.Dir(constants.InitrdPath), initrd)
+	if err != nil {
+		cfg.Config.Logger.Errorf("could set a relative path from '%s' to '%s': %v", constants.InitrdPath, initrd, err)
+		return err
+	}
+	err = cfg.Fs.Symlink(relInitrd, constants.InitrdPath)
 	if err != nil {
 		cfg.Config.Logger.Errorf("failed creating initrd symlink")
 		return err
-	}
-
-	err = utils.RelativizeLink(cfg.Fs, constants.InitrdPath)
-	if err != nil {
-		cfg.Config.Logger.Errorf("failed relativizing initrd symlink")
 	}
 
 	return err

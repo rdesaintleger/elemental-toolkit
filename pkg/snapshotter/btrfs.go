@@ -18,6 +18,7 @@ package snapshotter
 
 import (
 	"bufio"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/rancher/elemental-toolkit/v2/pkg/constants"
@@ -35,13 +37,14 @@ import (
 )
 
 const (
-	topSubvolID          = 5
+	btrfsQGroup          = "1/0"
 	rootSubvol           = "@"
 	snapshotsPath        = ".snapshots"
 	snapshotPathTmpl     = ".snapshots/%d/snapshot"
 	snapshotPathRegex    = `.snapshots/(\d+)/snapshot`
+	snapshotInfoPath     = ".snapshots/%d/info.xml"
 	snapshotWorkDir      = "snapshot.workDir"
-	snapperBootstrapPath = ".bootstrap"
+	dateFormat           = "2006-01-02 15:04:05"
 	snapperRootConfig    = "/etc/snapper/configs/root"
 	snapperSysconfig     = "/etc/sysconfig/snapper"
 	snapperDefaultconfig = "/etc/default/snapper"
@@ -50,16 +53,16 @@ const (
 var _ types.Snapshotter = (*Btrfs)(nil)
 
 type Btrfs struct {
-	cfg               types.Config
-	snapshotterCfg    types.SnapshotterConfig
-	btrfsCfg          types.BtrfsConfig
-	rootDir           string
-	snapshotsDir      string
-	stateDir          string
-	efiDir            string
-	currentSnapshotID int
-	activeSnapshotID  int
-	bootloader        types.Bootloader
+	cfg              types.Config
+	snapshotterCfg   types.SnapshotterConfig
+	btrfsCfg         types.BtrfsConfig
+	rootDir          string
+	stateDir         string
+	efiDir           string
+	activeSnapshotID int
+	topSubvolID      int
+	bootloader       types.Bootloader
+	installing       bool
 }
 
 type btrfsSubvol struct {
@@ -68,6 +71,23 @@ type btrfsSubvol struct {
 }
 
 type btrfsSubvolList []btrfsSubvol
+
+type Date time.Time
+
+type SnapperSnapshotXML struct {
+	XMLName     xml.Name `xml:"snapshot"`
+	Type        string   `xml:"type"`
+	Num         int      `xml:"num"`
+	Date        Date     `xml:"date"`
+	Cleanup     string   `xml:"cleanup"`
+	Description string   `xml:"description"`
+}
+
+func (d Date) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	t := time.Time(d)
+	v := t.Format(dateFormat)
+	return e.EncodeElement(v, start)
+}
 
 // NewLoopDeviceSnapshotter creates a new loop device snapshotter vased on the given configuration and the given bootloader
 func newBtrfsSnapshotter(cfg types.Config, snapCfg types.SnapshotterConfig, bootloader types.Bootloader) (types.Snapshotter, error) {
@@ -104,29 +124,25 @@ func (b *Btrfs) InitSnapshotter(state *types.Partition, efiDir string) error {
 	var ok bool
 
 	b.cfg.Logger.Infof("Initiate btrfs snapshotter at %s", state.MountPoint)
-	b.currentSnapshotID = 0
+	b.rootDir = ""
 	b.stateDir = state.MountPoint
 	b.efiDir = efiDir
 
 	b.cfg.Logger.Debug("Checking if essential subvolumes are already created")
 	if ok, err = b.isInitiated(state.MountPoint); ok {
 		if elemental.IsActiveMode(b.cfg) || elemental.IsPassiveMode(b.cfg) {
-			// if in active or passive mode, assume that root, state and snapshots are already mounted
-			return b.configureMountPointAndRootDir(state)
+			return b.configureSnapperAndRootDir(state)
 		}
+		b.cfg.Logger.Debug("Remount state partition at root subvolume")
+		return b.remountStatePartition(state)
 	} else if err != nil {
-		b.cfg.Logger.Errorf("failed loading initial snapshotter state: %v", err)
+		b.cfg.Logger.Errorf("failed loading initial snapshotter state: %s", err.Error())
 		return err
-	} else {
-		b.cfg.Logger.Debug("Running initial btrfs configuration")
-		err = b.setBtrfsForFirstTime(state)
-		if err != nil {
-			return err
-		}
 	}
 
-	b.cfg.Logger.Debug("Remount state partition at root subvolume")
-	return b.remountStatePartition(state)
+	b.installing = true
+	b.cfg.Logger.Debug("Running initial btrfs configuration")
+	return b.setBtrfsForFirstTime(state)
 }
 
 func (b *Btrfs) StartTransaction() (*types.Snapshot, error) {
@@ -137,49 +153,35 @@ func (b *Btrfs) StartTransaction() (*types.Snapshot, error) {
 
 	b.cfg.Logger.Info("Starting a btrfs snapshotter transaction")
 
-	if b.stateDir == "" || b.snapshotsDir == "" {
+	if !b.installing && b.activeSnapshotID == 0 {
 		b.cfg.Logger.Errorf("Snapshotter should have been initalized before starting a transaction")
 		return nil, fmt.Errorf("uninitialized snapshotter")
 	}
 
-	if b.activeSnapshotID > 0 {
+	snapshotsDir := b.getSnapshotsDirectory()
+
+	if b.activeSnapshotID > 0 && !b.btrfsCfg.DisableSnapper {
 		b.cfg.Logger.Infof("Creating a new snapshot from %d", b.activeSnapshotID)
-		if !b.btrfsCfg.DisableSnapper {
-			args := []string{
-				"create", "--from", strconv.Itoa(b.activeSnapshotID),
-				"--read-write",
-				"--print-number",
-				"--description", fmt.Sprintf("Update for snapshot %d", b.activeSnapshotID),
-				"--cleanup-algorithm", "number",
-				"--userdata", "update-in-progress=yes",
-			}
-			cmdOut, err := b.runCurrentSnapper(args...)
-			if err != nil {
-				b.cfg.Logger.Errorf("snapper failed to create a new snapshot: %v", err)
-				return nil, err
-			}
-			newID, err = strconv.Atoi(strings.TrimSpace(string(cmdOut)))
-			if err != nil {
-				b.cfg.Logger.Errorf("failed parsing new snapshot ID")
-				return nil, err
-			}
-		} else {
-			ids, err := b.GetSnapshots()
-			if err != nil {
-				b.cfg.Logger.Errorf("unable to get btrfs snapshots")
-				return nil, err
-			}
-
-			// minimum ID
-			newID = 1
-
-			for _, id := range ids {
-				// search for next ID to be used
-				newID = max(id+1, newID)
-			}
+		args := []string{
+			"create", "--from", strconv.Itoa(b.activeSnapshotID),
+			"--read-write",
+			"--print-number",
+			"--description", fmt.Sprintf("Update for snapshot %d", b.activeSnapshotID),
+			"--cleanup-algorithm", "number",
+			"--userdata", "update-in-progress=yes",
+		}
+		cmdOut, err := b.runCurrentSnapper(args...)
+		if err != nil {
+			b.cfg.Logger.Errorf("snapper failed to create a new snapshot: %v", err)
+			return nil, err
+		}
+		newID, err = strconv.Atoi(strings.TrimSpace(string(cmdOut)))
+		if err != nil {
+			b.cfg.Logger.Errorf("failed parsing new snapshot ID")
+			return nil, err
 		}
 
-		path = filepath.Join(filepath.Dir(b.snapshotsDir), fmt.Sprintf(snapshotPathTmpl, newID))
+		path = filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, newID))
 		workingDir = filepath.Join(filepath.Dir(path), snapshotWorkDir)
 		err = utils.MkdirAll(b.cfg.Fs, workingDir, constants.DirPerm)
 		if err != nil {
@@ -187,64 +189,65 @@ func (b *Btrfs) StartTransaction() (*types.Snapshot, error) {
 			_ = b.DeleteSnapshot(newID)
 			return nil, err
 		}
+	} else {
+		newID = 1
+		description := "first root filesystem"
 
 		if b.btrfsCfg.DisableSnapper {
-			source := filepath.Join(filepath.Dir(b.snapshotsDir), fmt.Sprintf(snapshotPathTmpl, b.activeSnapshotID))
-			cmdOut, err := b.cfg.Runner.Run("btrfs", "subvolume", "snapshot", "-i", "1/0", source, path)
-			if err != nil {
-				b.cfg.Logger.Errorf("failed creating snapshot volume: %s", string(cmdOut))
-				_ = b.DeleteSnapshot(newID)
-				return nil, err
+			ids := []int{}
+			b.loadBtrfsSnapshots(&ids)
+			for _, id := range ids {
+				// search for next ID to be used
+				newID = max(id+1, newID)
 			}
 		}
-	} else {
-		b.cfg.Logger.Info("Bootstraping first root filesystem")
 
-		// assume ID of snapshot will be '1'
-		newID = 1
-		path = filepath.Join(filepath.Dir(b.snapshotsDir), fmt.Sprintf(snapshotPathTmpl, newID))
+		if newID == 1 {
+			b.cfg.Logger.Info("Creating first root filesystem as a snapshot")
+		} else {
+			description = fmt.Sprintf("Update for snapshot %d", b.activeSnapshotID)
+		}
 
-		if !b.btrfsCfg.DisableSnapper {
-			workingDir = filepath.Join(b.stateDir, snapperBootstrapPath)
-
-			// make all parent directories but not target as it will be a subvolume
-			err = utils.MkdirAll(b.cfg.Fs, filepath.Dir(workingDir), constants.DirPerm)
-			if err != nil {
-				return nil, err
-			}
+		path = filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, newID))
+		workingDir = filepath.Join(filepath.Dir(path), snapshotWorkDir)
+		err = utils.MkdirAll(b.cfg.Fs, filepath.Dir(path), constants.DirPerm)
+		if err != nil {
+			return nil, err
+		}
+		if newID == 1 {
 			cmdOut, err := b.cfg.Runner.Run(
-				"btrfs", "subvolume", "create", "-i", "1/0",
-				workingDir,
+				"btrfs", "subvolume", "create", "-i", btrfsQGroup,
+				filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, newID)),
 			)
 			if err != nil {
-				b.cfg.Logger.Errorf("failed creating first snapshot volume: %s", string(cmdOut))
+				b.cfg.Logger.Errorf("failed creating snapshot volume: %s", string(cmdOut))
 				return nil, err
 			}
+			workingDir = path
 		} else {
-			workingDir = filepath.Join(filepath.Dir(path), snapshotWorkDir)
-
-			// create snapshot working dir
 			err = utils.MkdirAll(b.cfg.Fs, workingDir, constants.DirPerm)
 			if err != nil {
 				b.cfg.Logger.Errorf("failed creating the snapshot working directory: %v", err)
-				_ = b.DeleteSnapshot(newID)
 				return nil, err
 			}
-
-			// create target subvolume
-			cmdOut, err := b.cfg.Runner.Run("btrfs", "subvolume", "create", "-i", "1/0", path)
+			source := filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, b.activeSnapshotID))
+			cmdOut, err := b.cfg.Runner.Run("btrfs", "subvolume", "snapshot", "-i", btrfsQGroup, source, path)
 			if err != nil {
-				b.cfg.Logger.Errorf("failed creating first snapshot volume: %s", string(cmdOut))
-				_ = b.DeleteSnapshot(newID)
+				b.cfg.Logger.Errorf("failed creating snapshot volume: %s", string(cmdOut))
 				return nil, err
 			}
+		}
+		snapperXML := filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotInfoPath, newID))
+		err = b.writeSnapperSnapshotXML(snapperXML, createSnapperSnapshotXML(newID, description))
+		if err != nil {
+			b.cfg.Logger.Errorf("failed creating snapper info XML")
+			return nil, err
 		}
 	}
 
 	err = utils.MkdirAll(b.cfg.Fs, constants.WorkingImgDir, constants.DirPerm)
 	if err != nil {
 		b.cfg.Logger.Errorf("failed creating working tree directory: %s", constants.WorkingImgDir)
-		_ = b.DeleteSnapshot(newID)
 		return nil, err
 	}
 
@@ -264,31 +267,10 @@ func (b *Btrfs) StartTransaction() (*types.Snapshot, error) {
 
 func (b *Btrfs) CloseTransactionOnError(snapshot *types.Snapshot) (err error) {
 	if snapshot.InProgress {
-		err = b.cfg.Mounter.Unmount(snapshot.MountPoint)
-
-		if err != nil {
-			b.cfg.Logger.Errorf("unable to unmount snapshot mountpoint %s: %v", snapshot.MountPoint, err)
-		}
+		_ = b.cfg.Mounter.Unmount(snapshot.MountPoint)
 	}
-
-	return b.DeleteSnapshot(snapshot.ID)
-}
-
-func (b *Btrfs) syncSnapshotWorkdir(snapshot *types.Snapshot) (err error) {
-	err = utils.MirrorData(b.cfg.Logger, b.cfg.Runner, b.cfg.Fs, snapshot.WorkDir, snapshot.Path)
-	if err != nil {
-		b.cfg.Logger.Errorf("failed syncing working directory with snapshot directory")
-		return err
-	}
-
-	err = b.cfg.Fs.RemoveAll(snapshot.WorkDir)
-	if err != nil {
-		b.cfg.Logger.Errorf("failed deleting snapshot's workdir '%s': %s", snapshot.WorkDir, err)
-		return err
-	}
-
-	snapshot.WorkDir = snapshot.Path
-	return nil
+	err = b.DeleteSnapshot(snapshot.ID)
+	return err
 }
 
 func (b *Btrfs) CloseTransaction(snapshot *types.Snapshot) (err error) {
@@ -298,9 +280,19 @@ func (b *Btrfs) CloseTransaction(snapshot *types.Snapshot) (err error) {
 		b.cfg.Logger.Debugf("No transaction to close for snapshot %d workdir", snapshot.ID)
 		return fmt.Errorf("given snapshot is not in progress")
 	}
+	defer func() {
+		if err != nil {
+			_ = b.DeleteSnapshot(snapshot.ID)
+		}
+	}()
 	b.cfg.Logger.Infof("Closing transaction for snapshot %d workdir", snapshot.ID)
 
-	snapshotsBind := map[string]string{b.snapshotsDir: filepath.Join("/", snapshotsPath)}
+	// Make sure snapshots mountpoint folder is part of the resulting snapshot image
+	err = utils.MkdirAll(b.cfg.Fs, filepath.Join(snapshot.WorkDir, snapshotsPath), constants.DirPerm)
+	if err != nil {
+		b.cfg.Logger.Errorf("failed creating snapshots folder: %v", err)
+		return err
+	}
 
 	b.cfg.Logger.Debugf("Unmount %s", snapshot.MountPoint)
 	err = b.cfg.Mounter.Unmount(snapshot.MountPoint)
@@ -309,81 +301,59 @@ func (b *Btrfs) CloseTransaction(snapshot *types.Snapshot) (err error) {
 		return err
 	}
 
-	if !b.btrfsCfg.DisableSnapper {
-		// when bootstraping snapper, snapshot is not created yet
-		if ok, err := utils.Exists(b.cfg.Fs, snapshot.Path); !ok {
-			// Configure snapper
-			err = b.configureSnapshotSnapper(snapshot)
-			if err != nil {
-				b.cfg.Logger.Errorf("failed configuring snapper: %v", err)
-				return err
-			}
-			cmdOut, err := b.runSnapshotSnapper(snapshot.WorkDir, snapshotsBind,
-				"--config", "root", "create",
-				"--read-write",
-				"--cleanup-algorithm", "number",
-				"--description", "first root filesystem",
-				"--userdata", "update-in-progress=no")
-			if err != nil {
-				b.cfg.Logger.Errorf("unable to create initial snapshot: %v", err)
-				b.cfg.Logger.Debugf("snapper output: %s", string(cmdOut))
-				return err
-			}
-
-			// we now have the first snapshot. delete bootstrap volume
-			_, err = b.deleteBootstrapSubvolume()
-			if err != nil {
-				b.cfg.Logger.Errorf("can't delete bootstrap subvolume: %v", err)
-				return err
-			}
-			snapshot.WorkDir = snapshot.Path
-		} else if err != nil {
-			b.cfg.Logger.Errorf("unable to stat snapshot %d workdir", snapshot.ID)
+	// when bootstraping snapshot.WorkDir is snapshot.Path
+	snapperUpdate := false
+	if snapshot.WorkDir != snapshot.Path {
+		err = utils.MirrorData(b.cfg.Logger, b.cfg.Runner, b.cfg.Fs, snapshot.WorkDir, snapshot.Path)
+		if err != nil {
+			b.cfg.Logger.Errorf("failed syncing working directory with snapshot directory")
 			return err
-		} else {
-			b.syncSnapshotWorkdir(snapshot)
+		}
 
-			// Configure snapper after sync (otherwise, snapper reports that workdir is not a volume)
-			err = b.configureSnapshotSnapper(snapshot)
-			if err != nil {
-				b.cfg.Logger.Errorf("failed configuring snapper: %v", err)
-				return err
-			}
+		err = b.cfg.Fs.RemoveAll(snapshot.WorkDir)
+		if err != nil {
+			b.cfg.Logger.Errorf("failed deleting snapshot's workdir '%s': %s", snapshot.WorkDir, err)
+			return err
+		}
+		snapperUpdate = true
+	}
+	// passed this line, snapshot.WorkDir is no longer valid
 
+	if !b.btrfsCfg.DisableSnapper {
+		// Configure snapper
+		err = b.configureSnapper(snapshot)
+		if err != nil {
+			b.cfg.Logger.Errorf("failed configuring snapper: %v", err)
+			return err
+		}
+
+		if snapperUpdate {
 			args := []string{"modify", "--userdata", "update-in-progress=no", strconv.Itoa(snapshot.ID)}
-			cmdOut, err := b.runCurrentSnapper(args...)
+			cmdOut, err = b.runCurrentSnapper(args...)
 			if err != nil {
-				b.cfg.Logger.Errorf("failed updating snapshot user data %d: %s", snapshot.ID, string(cmdOut))
+				b.cfg.Logger.Errorf("failed setting snapper snapshot user data %d: %s", snapshot.ID, string(cmdOut))
 				return err
 			}
 		}
-	} else {
-		b.syncSnapshotWorkdir(snapshot)
 	}
 
-	// Make sure snapshots mountpoint folder is part of the resulting snapshot image
-	err = utils.MkdirAll(b.cfg.Fs, filepath.Join(snapshot.Path, snapshotsPath), constants.DirPerm)
-	if err != nil {
-		b.cfg.Logger.Errorf("failed creating snapshots folder: %v", err)
-		return err
-	}
-
-	err = elemental.ApplySELinuxLabels(b.cfg, snapshot.Path, snapshotsBind)
+	snapshotsDir := b.getSnapshotsDirectory()
+	extraBind := map[string]string{filepath.Join(filepath.Dir(snapshotsDir), snapshotsPath): filepath.Join("/", snapshotsPath)}
+	err = elemental.ApplySELinuxLabels(b.cfg, snapshot.Path, extraBind)
 	if err != nil {
 		b.cfg.Logger.Errorf("failed relabelling snapshot path: %s", snapshot.Path)
 		return err
 	}
 
-	// sets the snapshot readonly
 	cmdOut, err = b.cfg.Runner.Run("btrfs", "property", "set", snapshot.Path, "ro", "true")
 	if err != nil {
 		b.cfg.Logger.Errorf("failed setting read only property to snapshot %d: %s", snapshot.ID, string(cmdOut))
 		return err
 	}
 
-	defaultSubvolID := topSubvolID
+	subvolID := b.topSubvolID
 	if !b.btrfsCfg.DisableDefaultSubVolume {
-		defaultSubvolID, err = b.findSubvolumeByPath(snapshot.Path)
+		subvolID, err = b.findSubvolumeByPath(snapshot.Path)
 		if err != nil {
 			b.cfg.Logger.Error("failed finding subvolume")
 			return err
@@ -393,7 +363,7 @@ func (b *Btrfs) CloseTransaction(snapshot *types.Snapshot) (err error) {
 		// to identify active snapshot (loopdevice snapshotter use same feature)
 		activeSnap := filepath.Join(b.stateDir, constants.ActiveSnapshot)
 		linkDst := fmt.Sprintf(snapshotPathTmpl, snapshot.ID)
-		b.cfg.Logger.Debugf("creating symlink %s to %s", activeSnap, linkDst)
+		b.cfg.Logger.Debugf("Creating symlink %s to %s", activeSnap, linkDst)
 		_ = b.cfg.Fs.Remove(activeSnap)
 		err = b.cfg.Fs.Symlink(linkDst, activeSnap)
 		if err != nil {
@@ -407,24 +377,20 @@ func (b *Btrfs) CloseTransaction(snapshot *types.Snapshot) (err error) {
 	}
 
 	// ensure default subvolume is always up to date
-	cmdOut, err = b.cfg.Runner.Run("btrfs", "subvolume", "set-default", strconv.Itoa(defaultSubvolID), snapshot.Path)
+	cmdOut, err = b.cfg.Runner.Run("btrfs", "subvolume", "set-default", strconv.Itoa(subvolID), snapshot.Path)
 	if err != nil {
 		b.cfg.Logger.Errorf("failed setting default subvolume property to snapshot %d: %s", snapshot.ID, string(cmdOut))
 		return err
 	}
 
-	err = b.updateBtrfsContext(b.stateDir)
-	if err != nil {
-		b.cfg.Logger.Errorf("got error updating snapshotter context %v", err)
-		return err
-	}
+	// update active snapshot
+	b.activeSnapshotID = snapshot.ID
 
-	// snapper has a special algorithm to clean snapshots.
-	// do not rely on it, use an implementation similar to loop device
-	// to handle pure btrfs snapshotter using same code
-	err = b.cleanOldSnapshots()
-	if err != nil {
-		b.cfg.Logger.Warnf("got error cleaning old snapshots %v", err)
+	if b.btrfsCfg.DisableSnapper {
+		_ = b.cleanOldSnapshots()
+	} else {
+		args := []string{"cleanup", "--path", filepath.Join(filepath.Dir(snapshotsDir), snapshotsPath), "number"}
+		_, _ = b.runCurrentSnapper(args...)
 	}
 
 	_ = b.setBootloader()
@@ -433,56 +399,33 @@ func (b *Btrfs) CloseTransaction(snapshot *types.Snapshot) (err error) {
 }
 
 func (b *Btrfs) DeleteSnapshot(id int) error {
-	b.cfg.Logger.Infof("Deleting snapshot %d", id)
 	var cmdOut []byte
 
-	if id <= 0 {
-		// ignore invalid ids
+	b.cfg.Logger.Infof("Deleting snapshot %d", id)
+
+	snapshots, err := b.GetSnapshots()
+	if err != nil {
+		b.cfg.Logger.Errorf("failed listing available snapshots: %v", err)
+		return err
+	}
+	if !slices.Contains(snapshots, id) {
+		b.cfg.Logger.Debugf("snapshot %d not found, nothing has been deleted", id)
 		return nil
 	}
 
-	if b.activeSnapshotID == id {
-		err := fmt.Errorf("active snapshot can't be deleted")
-		return err
-	}
-
-	if b.currentSnapshotID == id {
-		err := fmt.Errorf("current snapshot can't be deleted")
-		return err
-	}
-
 	if !b.btrfsCfg.DisableSnapper {
-		if (b.activeSnapshotID == 0) && (id == 1) {
-			// handle special bootstrap volume
-			ok, err := b.deleteBootstrapSubvolume()
-
-			if ok {
-				return err
-			} else {
-				b.cfg.Logger.Debugf("snapshot %d not found, nothing has been deleted", id)
-				return nil
-			}
-		}
-
-		snapshots, err := b.GetSnapshots()
-		if err != nil {
-			b.cfg.Logger.Errorf("failed listing available snapshots: %v", err)
-			return err
-		}
-		if !slices.Contains(snapshots, id) {
-			b.cfg.Logger.Debugf("snapshot %d not found, nothing has been deleted", id)
-			return nil
-		}
-
 		args := []string{"delete", "--sync", strconv.Itoa(id)}
-		cmdOut, err := b.runCurrentSnapper(args...)
+		cmdOut, err = b.runCurrentSnapper(args...)
 		if err != nil {
 			b.cfg.Logger.Errorf("snapper failed deleting snapshot %d: %s", id, string(cmdOut))
 			return err
 		}
 	} else {
+		// retrieve global snapshots directory
+		snapshotsDir := b.getSnapshotsDirectory()
+
 		// Remove btrfs subvolume first
-		snapshotDir := filepath.Join(filepath.Dir(b.snapshotsDir), fmt.Sprintf(snapshotPathTmpl, id))
+		snapshotDir := filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, id))
 		if ok, err := utils.Exists(b.cfg.Fs, snapshotDir); ok {
 			args := []string{"subvolume", "delete", "-c", snapshotDir}
 			cmdOut, err = b.cfg.Runner.Run("btrfs", args...)
@@ -514,42 +457,20 @@ func (b *Btrfs) DeleteSnapshot(id int) error {
 	return nil
 }
 
-func (b *Btrfs) GetSnapshots() (snapshots []int, err error) {
-	ids := []int{}
+func (b *Btrfs) GetSnapshots() ([]int, error) {
+	var err error
+	var ok bool
 
-	if b.stateDir == "" {
-		return ids, fmt.Errorf("unable to find btrfs state directory")
-	}
-	if !b.btrfsCfg.DisableSnapper {
-		err = b.loadSnapperSnapshots(&ids)
-		if err != nil {
-			return ids, err
-		}
-	} else {
-		list, err := b.cfg.Fs.ReadDir(b.snapshotsDir)
-		if err != nil {
-			b.cfg.Logger.Errorf("failed listing btrfs snapshots directory: %v", err)
-			return ids, err
-		}
-
-		re := regexp.MustCompile(`^\d+$`)
-		for _, entry := range list {
-			if entry.IsDir() {
-				entryName := entry.Name()
-
-				if re.MatchString(entryName) {
-					id, _ := strconv.Atoi(entryName)
-					snapshotDir := filepath.Join(filepath.Dir(b.snapshotsDir), fmt.Sprintf(snapshotPathTmpl, id))
-
-					if validateDirectory(b.cfg.Fs, snapshotDir) != "" {
-						ids = append(ids, id)
-					}
-				}
-			}
+	snapshots := []int{}
+	if ok, err = b.isInitiated(b.stateDir); ok {
+		if b.btrfsCfg.DisableSnapper {
+			err = b.loadBtrfsSnapshots(&snapshots)
+		} else {
+			err = b.loadSnapperSnapshots(&snapshots)
 		}
 	}
 
-	return ids, err
+	return snapshots, err
 }
 
 func (b *Btrfs) loadSnapperSnapshots(ids *[]int) error {
@@ -578,6 +499,36 @@ func (b *Btrfs) loadSnapperSnapshots(ids *[]int) error {
 		}
 	}
 
+	return nil
+}
+
+func (b *Btrfs) loadBtrfsSnapshots(ids *[]int) error {
+	snapshotsDir := b.getSnapshotsDirectory()
+	list, err := b.cfg.Fs.ReadDir(snapshotsDir)
+	if err != nil {
+		b.cfg.Logger.Errorf("failed listing btrfs snapshots directory: %v", err)
+		return err
+	}
+
+	re := regexp.MustCompile(`^\d+$`)
+	for _, entry := range list {
+		if entry.IsDir() {
+			entryName := entry.Name()
+
+			if re.MatchString(entryName) {
+				id, _ := strconv.Atoi(entryName)
+				snapshotDir := filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, id))
+
+				exists, err := utils.Exists(b.cfg.Fs, snapshotDir)
+				if err != nil {
+					b.cfg.Logger.Errorf("failed checking snapshot directory %s: %v", snapshotDir, err)
+				}
+				if exists {
+					*ids = append(*ids, id)
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -627,12 +578,12 @@ func (b *Btrfs) getStateSubvolumes(rootDir string) (rootVolume *btrfsSubvol, sna
 	return rootVolume, snapshotsVolume, err
 }
 
-func (b *Btrfs) getActiveSnapshot() (int, error) {
+func (b *Btrfs) getActiveSnapshot(stateDir string) (int, error) {
 	re := regexp.MustCompile(snapshotPathRegex)
 	if !b.btrfsCfg.DisableDefaultSubVolume {
-		out, err := b.cfg.Runner.Run("btrfs", "subvolume", "get-default", b.stateDir)
+		out, err := b.cfg.Runner.Run("btrfs", "subvolume", "get-default", stateDir)
 		if err != nil {
-			b.cfg.Logger.Errorf("failed getting default btrfs subvolume: %v", err)
+			b.cfg.Logger.Errorf("failed listing btrfs subvolumes: %v", err)
 			return 0, err
 		}
 		list := b.parseVolumes(strings.TrimSpace(string(out)))
@@ -644,7 +595,7 @@ func (b *Btrfs) getActiveSnapshot() (int, error) {
 			}
 		}
 	} else {
-		activeSnap := filepath.Join(b.stateDir, constants.ActiveSnapshot)
+		activeSnap := filepath.Join(stateDir, constants.ActiveSnapshot)
 		activePath, err := b.cfg.Fs.Readlink(activeSnap)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -653,7 +604,7 @@ func (b *Btrfs) getActiveSnapshot() (int, error) {
 			b.cfg.Logger.Errorf("failed reading active symlink %s: %v", activeSnap, err)
 			return 0, err
 		}
-		b.cfg.Logger.Debugf("active snapshot path is %s", activePath)
+		b.cfg.Logger.Debugf("Active snapshot path is %s", activePath)
 
 		match := re.FindStringSubmatch(activePath)
 		if match != nil {
@@ -665,7 +616,7 @@ func (b *Btrfs) getActiveSnapshot() (int, error) {
 }
 
 func (b *Btrfs) parseVolumes(rawBtrfsList string) btrfsSubvolList {
-	re := regexp.MustCompile(`^ID (\d+) gen \d+ top level \d+ path (.*)$`)
+	re := regexp.MustCompile(`^ID (\d+) gen \d+ top level (\d+) path (.*)$`)
 	list := btrfsSubvolList{}
 
 	scanner := bufio.NewScanner(strings.NewReader(rawBtrfsList))
@@ -673,24 +624,71 @@ func (b *Btrfs) parseVolumes(rawBtrfsList string) btrfsSubvolList {
 		match := re.FindStringSubmatch(strings.TrimSpace(scanner.Text()))
 		if match != nil {
 			id, _ := strconv.Atoi(match[1])
-			path := strings.TrimPrefix(match[2], "<FS_TREE>/")
+			path := strings.TrimPrefix(match[3], "<FS_TREE>/")
 			list = append(list, btrfsSubvol{id: id, path: path})
+
+			if path == rootSubvol {
+				// save top level subvolume. will be used by set default
+				b.topSubvolID, _ = strconv.Atoi(match[2])
+			}
 		}
 	}
 	return list
 }
 
 func (b *Btrfs) isInitiated(rootDir string) (bool, error) {
+	if b.activeSnapshotID > 0 {
+		return true, nil
+	}
+	if b.installing {
+		return false, nil
+	}
+
 	rootVolume, snapshotsVolume, err := b.getStateSubvolumes(rootDir)
 	if err != nil {
 		return false, err
 	}
 
 	if (rootVolume != nil) && (snapshotsVolume != nil) {
-		return true, nil
+		_, _, stateDir, err := findStateMount(b.cfg.Runner, rootDir)
+		if err != nil {
+			return false, err
+		}
+		id, err := b.getActiveSnapshot(stateDir)
+		if err != nil {
+			return false, err
+		}
+		if id > 0 {
+			b.activeSnapshotID = id
+			return true, nil
+		}
 	}
 
 	return false, nil
+}
+
+func createSnapperSnapshotXML(newID int, description string) SnapperSnapshotXML {
+	return SnapperSnapshotXML{
+		Type:        "single",
+		Num:         newID,
+		Date:        Date(time.Now()),
+		Description: description,
+		Cleanup:     "number",
+	}
+}
+
+func (b *Btrfs) writeSnapperSnapshotXML(filepath string, snapshot SnapperSnapshotXML) error {
+	data, err := xml.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		b.cfg.Logger.Errorf("failed marhsalling snapper's snapshot XML: %v", err)
+		return err
+	}
+	err = b.cfg.Fs.WriteFile(filepath, data, constants.FilePerm)
+	if err != nil {
+		b.cfg.Logger.Errorf("failed writing snapper's snapshot XML: %v", err)
+		return err
+	}
+	return nil
 }
 
 func (b *Btrfs) findSubvolumeByPath(path string) (int, error) {
@@ -699,7 +697,12 @@ func (b *Btrfs) findSubvolumeByPath(path string) (int, error) {
 		b.cfg.Logger.Errorf("failed inspecting btrfs subvolume path: %v", err)
 		return 0, err
 	}
-	return strconv.Atoi(strings.TrimSpace(string(out)))
+	subvolID, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		err = fmt.Errorf("unable to read subvolume rootid for %s: %v", path, err)
+	}
+
+	return subvolID, err
 }
 
 func (b *Btrfs) getPassiveSnapshots() ([]int, error) {
@@ -746,10 +749,9 @@ func (b *Btrfs) setBootloader() error {
 	var passives, fallbacks []string
 
 	b.cfg.Logger.Infof("Setting bootloader with current passive snapshots")
-
 	ids, err := b.getPassiveSnapshots()
 	if err != nil {
-		b.cfg.Logger.Warnf("failed getting passive snapshots: %v", err)
+		b.cfg.Logger.Warnf("failed getting current passive snapshots: %v", err)
 		return err
 	}
 
@@ -781,11 +783,11 @@ func (b *Btrfs) setBootloader() error {
 	return err
 }
 
-func (b *Btrfs) configureSnapshotSnapper(snapshot *types.Snapshot) error {
+func (b *Btrfs) configureSnapper(snapshot *types.Snapshot) error {
 	var extraPaths map[string]string
 
-	rootconfig := filepath.Join(snapshot.WorkDir, snapperRootConfig)
-	snapshotDir := filepath.Join(snapshot.WorkDir, snapshotsPath)
+	rootconfig := filepath.Join(snapshot.Path, snapperRootConfig)
+	snapshotDir := filepath.Join(snapshot.Path, snapshotsPath)
 
 	if ok, err := utils.Exists(b.cfg.Fs, rootconfig); !ok {
 		// ensure snapshots directory does not exists otherwise create config will fail
@@ -796,7 +798,7 @@ func (b *Btrfs) configureSnapshotSnapper(snapshot *types.Snapshot) error {
 		}
 
 		// actually create the 'root' config file
-		cmdOut, err := b.runSnapshotSnapper(snapshot.WorkDir, extraPaths,
+		cmdOut, err := b.runSnapshotSnapper(snapshot.Path, extraPaths,
 			"--config", "root", "create-config",
 			"--fstype", "btrfs", "/")
 		if err != nil {
@@ -826,9 +828,9 @@ func (b *Btrfs) configureSnapshotSnapper(snapshot *types.Snapshot) error {
 
 	// set global snapper configuration
 	sysconfigData := map[string]string{}
-	sysconfig := filepath.Join(snapshot.WorkDir, snapperDefaultconfig)
+	sysconfig := filepath.Join(snapshot.Path, snapperDefaultconfig)
 	if ok, _ := utils.Exists(b.cfg.Fs, sysconfig); !ok {
-		sysconfig = filepath.Join(snapshot.WorkDir, snapperSysconfig)
+		sysconfig = filepath.Join(snapshot.Path, snapperSysconfig)
 	}
 
 	if ok, _ := utils.Exists(b.cfg.Fs, sysconfig); ok {
@@ -854,7 +856,7 @@ func (b *Btrfs) configureSnapshotSnapper(snapshot *types.Snapshot) error {
 	}
 
 	rootconfigData["TIMELINE_CREATE"] = "no"
-	rootconfigData["QGROUP"] = "1/0"
+	rootconfigData["QGROUP"] = btrfsQGroup
 	rootconfigData["NUMBER_LIMIT"] = strconv.Itoa(b.snapshotterCfg.MaxSnaps)
 	rootconfigData["NUMBER_LIMIT_IMPORTANT"] = strconv.Itoa(b.snapshotterCfg.MaxSnaps)
 
@@ -864,7 +866,6 @@ func (b *Btrfs) configureSnapshotSnapper(snapshot *types.Snapshot) error {
 		b.cfg.Logger.Errorf("failed writing snapper root configuration file: %v", err)
 		return err
 	}
-
 	return nil
 }
 
@@ -883,28 +884,29 @@ func (b *Btrfs) remountStatePartition(state *types.Partition) error {
 		return err
 	}
 
-	return b.updateBtrfsContext(state.Path)
+	b.stateDir = state.MountPoint
+	return err
 }
 
 func (b *Btrfs) setBtrfsForFirstTime(state *types.Partition) error {
-	topDir, _, _, _, err := b.findStateMount(state.Path)
+	topDir, _, _, err := findStateMount(b.cfg.Runner, state.Path)
 	if err != nil {
 		b.cfg.Logger.Errorf("could not find expected btrfs top level directory")
 		return err
 	} else if topDir == "" {
-		b.cfg.Logger.Errorf("btrfs root is not mounted, can't initialize the snapshotter within an existing subvolume")
+		err = fmt.Errorf("btrfs root is not mounted, can't initialize the snapshotter within an existing subvolume")
 		return err
 	}
 
 	b.cfg.Logger.Debug("Enabling btrfs quota")
-	cmdOut, err := b.cfg.Runner.Run("btrfs", "quota", "enable", topDir)
+	cmdOut, err := b.cfg.Runner.Run("btrfs", "quota", "enable", state.MountPoint)
 	if err != nil {
-		b.cfg.Logger.Errorf("failed setting quota for btrfs partition at %s: %s", topDir, string(cmdOut))
+		b.cfg.Logger.Errorf("failed setting quota for btrfs partition at %s: %s", state.MountPoint, string(cmdOut))
 		return err
 	}
 
 	b.cfg.Logger.Debug("Creating essential subvolumes")
-	for _, subvolume := range []string{filepath.Join(topDir, rootSubvol), filepath.Join(topDir, rootSubvol, snapshotsPath)} {
+	for _, subvolume := range []string{filepath.Join(state.MountPoint, rootSubvol), filepath.Join(state.MountPoint, rootSubvol, snapshotsPath)} {
 		b.cfg.Logger.Debugf("Creating subvolume: %s", subvolume)
 		cmdOut, err = b.cfg.Runner.Run("btrfs", "subvolume", "create", subvolume)
 		if err != nil {
@@ -914,168 +916,90 @@ func (b *Btrfs) setBtrfsForFirstTime(state *types.Partition) error {
 	}
 
 	b.cfg.Logger.Debug("Create btrfs quota group")
-	cmdOut, err = b.cfg.Runner.Run("btrfs", "qgroup", "create", "1/0", topDir)
+	cmdOut, err = b.cfg.Runner.Run("btrfs", "qgroup", "create", btrfsQGroup, state.MountPoint)
 	if err != nil {
-		b.cfg.Logger.Errorf("failed creating quota group for %s: %s", topDir, string(cmdOut))
+		b.cfg.Logger.Errorf("failed creating quota group for %s: %s", state.MountPoint, string(cmdOut))
 		return err
 	}
+	return b.remountStatePartition(state)
+}
+
+func (b *Btrfs) configureSnapperAndRootDir(state *types.Partition) error {
+	_, rootDir, stateMount, err := findStateMount(b.cfg.Runner, state.Path)
+
+	if stateMount == "" || rootDir == "" {
+		err = fmt.Errorf("could not find expected mountpoints")
+	}
+
+	if err != nil {
+		b.cfg.Logger.Errorf("failed setting snapper root and state partition mountpoint: %v", err)
+		return err
+	}
+
+	state.MountPoint = stateMount
+	b.rootDir = rootDir
+	b.stateDir = stateMount
 	return nil
 }
 
-func (b *Btrfs) configureMountPointAndRootDir(state *types.Partition) error {
-	err := b.updateBtrfsContext(state.Path)
-	if b.stateDir == "" || b.rootDir == "" {
-		err = fmt.Errorf("could not find expected mountpoints")
-		return err
-	}
-
+func findStateMount(runner types.Runner, device string) (topDir string, rootDir string, stateMount string, err error) {
+	output, err := runner.Run("findmnt", "-lno", "SOURCE,TARGET", device)
 	if err != nil {
-		b.cfg.Logger.Errorf("failed setting snapper state partition mountpoint: %v", err)
-		return err
+		return "", "", "", err
 	}
+	r := regexp.MustCompile(`@/.snapshots/\d+/snapshot`)
 
-	// state.MountPoint must be updated otherwise state.yaml will fail to update
-	state.MountPoint = b.stateDir
-
-	return err
-}
-
-// simple convenience function which returns a given path only if it exists and is a directory
-func validateDirectory(fs types.FS, path string) (validated string) {
-	info, _ := fs.Lstat(path)
-	if info != nil && info.IsDir() {
-		validated = path
-	}
-
-	return validated
-}
-
-// General purpose function to retrieve all btrfs mount points for a given state partition
-// incoming path can be either a disk device or the path of a mounted btrfs filesystem
-// goal of this function is to be able to resolve path to all relevant btrfs directories
-func (b *Btrfs) findStateMount(path string) (topDir string, rootDir string, snapshotsDir string, stateDir string, err error) {
-	output, err := b.cfg.Runner.Run("findmnt", "-lno", "SOURCE,TARGET,FSTYPE", path)
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	// first pass accumulate findmnt lines.
-	// This allow to ensure there is only one result when using a mounted btrfs filesystem path as argument
-	var lines [][]string
 	scanner := bufio.NewScanner(strings.NewReader(strings.TrimSpace(string(output))))
 	for scanner.Scan() {
 		lineFields := strings.Fields(scanner.Text())
-		if len(lineFields) != 3 {
+		if len(lineFields) != 2 {
 			continue
 		}
-		// Only handle lines with "btrfs" type
-		if lineFields[2] == "btrfs" {
-			lines = append(lines, lineFields)
-		}
-	}
 
-	r := regexp.MustCompile(`^@/\.snapshots/(\d+)/snapshot$`)
-	snapshotsSubvol := filepath.Join(rootSubvol, snapshotsPath)
-
-	// second pass over parsed findmnt lines. search each mounted subvolume of interest.
-	var rootDirMatches []string
-	for _, lineFields := range lines {
 		subStart := strings.Index(lineFields[0], "[/")
 
-		// Additional recursive logic if array length is 1 and device matches target
-		if len(lines) == 1 && path == lineFields[1] {
+		if lineFields[1] == device {
 			// Handle subStart logic for recursive call
 			if subStart != -1 {
-				return b.findStateMount(lineFields[0][0:subStart])
+				return findStateMount(runner, lineFields[0][0:subStart])
 			}
-			return b.findStateMount(lineFields[0])
+			return findStateMount(runner, lineFields[0])
 		}
 
 		subEnd := strings.LastIndex(lineFields[0], "]")
 
-		// Check if no subvolume is present
 		if subStart == -1 && subEnd == -1 {
 			topDir = lineFields[1] // this is the btrfs root
 		} else {
 			subVolume := lineFields[0][subStart+2 : subEnd]
 
 			if subVolume == rootSubvol {
-				stateDir = lineFields[1]
-			} else if subVolume == snapshotsSubvol {
-				snapshotsDir = lineFields[1]
-			} else if matches := r.FindStringSubmatch(subVolume); matches != nil && lineFields[1] == "/" {
-				// only define rootDir if mounted as '/'
-				rootDirMatches = append(rootDirMatches, lineFields[1])
-
-				// save snapshot ID as current ID
-				b.currentSnapshotID, _ = strconv.Atoi(matches[1])
+				stateMount = lineFields[1]
+			} else if r.MatchString(subVolume) {
+				rootDir = lineFields[1]
 			}
 		}
 	}
 
-	// assume that is there is only one match for a snapshot, this is the rootDir
-	if len(rootDirMatches) == 1 {
-		rootDir = rootDirMatches[0]
-	}
-
 	// If stateDir isn't found but topDir exists, append the rootSubvol to topDir
-	if stateDir == "" && topDir != "" {
-		stateDir = validateDirectory(b.cfg.Fs, filepath.Join(topDir, rootSubvol))
+	if stateMount == "" && topDir != "" {
+		stateMount = filepath.Join(topDir, rootSubvol)
 	}
 
-	// If snapshotsDir isn't found but rootDir or stateDir exists, append the subvolume to stateDir
-	if snapshotsDir == "" && rootDir != "" {
-		snapshotsDir = validateDirectory(b.cfg.Fs, filepath.Join(rootDir, snapshotsPath))
-	}
-	if snapshotsDir == "" && stateDir != "" {
-		snapshotsDir = validateDirectory(b.cfg.Fs, filepath.Join(stateDir, snapshotsPath))
-	}
-
-	return topDir, rootDir, snapshotsDir, stateDir, err
-}
-
-func (b *Btrfs) updateBtrfsContext(path string) (err error) {
-	_, rootDir, snapshotsDir, stateDir, err := b.findStateMount(path)
-	if err == nil {
-		b.rootDir = rootDir
-		b.snapshotsDir = snapshotsDir
-		b.stateDir = stateDir
-		b.activeSnapshotID, err = b.getActiveSnapshot()
-	}
-
-	return err
-}
-
-func (b *Btrfs) deleteBootstrapSubvolume() (bool, error) {
-	bootstrapDir := filepath.Join(b.stateDir, snapperBootstrapPath)
-
-	if ok, err := utils.Exists(b.cfg.Fs, bootstrapDir); ok {
-		args := []string{"subvolume", "delete", "-c", bootstrapDir}
-		cmdOut, err := b.cfg.Runner.Run("btrfs", args...)
-		if err != nil {
-			b.cfg.Logger.Errorf("failed deleting bootstrap subvolume: %s", string(cmdOut))
-			return false, err
-		}
-
-		return true, nil
-	} else if err != nil {
-		b.cfg.Logger.Errorf("unable to stat bootstrap subvolume: %s", bootstrapDir)
-		return false, err
-	}
-
-	return false, nil
+	return topDir, rootDir, stateMount, err
 }
 
 // wrapper function to execute snapper in the current context
 func (b *Btrfs) runCurrentSnapper(args ...string) (out []byte, err error) {
 	snapperArgs := []string{}
 
-	if !(elemental.IsActiveMode(b.cfg) || elemental.IsPassiveMode(b.cfg)) {
+	if b.rootDir == "" {
+		snapshotsDir := b.getSnapshotsDirectory()
 		// Check if snapshots subvolume is mounted
-		rootDir := filepath.Join(filepath.Dir(b.snapshotsDir), fmt.Sprintf(snapshotPathTmpl, b.activeSnapshotID))
+		rootDir := filepath.Join(filepath.Dir(snapshotsDir), fmt.Sprintf(snapshotPathTmpl, b.activeSnapshotID))
 		snapshotsSubvolume := filepath.Join(rootDir, snapshotsPath)
 		if notMnt, _ := b.cfg.Mounter.IsLikelyNotMountPoint(snapshotsSubvolume); notMnt {
-			err = b.cfg.Mounter.Mount(b.snapshotsDir, snapshotsSubvolume, "bind", []string{"bind"})
+			err = b.cfg.Mounter.Mount(snapshotsDir, snapshotsSubvolume, "bind", []string{"bind"})
 			if err != nil {
 				return nil, err
 			}
@@ -1089,9 +1013,19 @@ func (b *Btrfs) runCurrentSnapper(args ...string) (out []byte, err error) {
 		}
 
 		snapperArgs = []string{"--no-dbus", "--root", rootDir}
+	} else if b.rootDir != "/" {
+		snapperArgs = []string{"--no-dbus", "--root", b.rootDir}
 	}
 	args = append(snapperArgs, args...)
 	return b.cfg.Runner.Run("snapper", args...)
+}
+
+func (b *Btrfs) getSnapshotsDirectory() string {
+	if b.rootDir == "" {
+		return filepath.Join(b.stateDir, snapshotsPath)
+	} else {
+		return filepath.Join(b.rootDir, snapshotsPath)
+	}
 }
 
 // wrapper function to execute snapper in the snapshot context
