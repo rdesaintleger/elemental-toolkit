@@ -581,7 +581,9 @@ func (b *Btrfs) getStateSubvolumes(rootDir string) (rootVolume *btrfsSubvol, sna
 func (b *Btrfs) getActiveSnapshot(stateDir string) (int, error) {
 	re := regexp.MustCompile(snapshotPathRegex)
 	if !b.btrfsCfg.DisableDefaultSubVolume {
-		out, err := b.cfg.Runner.Run("btrfs", "subvolume", "get-default", stateDir)
+		// when using default subvolume use stateDir from structure, incoming argument
+		// may be an empty string (fixes recovery)
+		out, err := b.cfg.Runner.Run("btrfs", "subvolume", "get-default", b.stateDir)
 		if err != nil {
 			b.cfg.Logger.Errorf("failed listing btrfs subvolumes: %v", err)
 			return 0, err
