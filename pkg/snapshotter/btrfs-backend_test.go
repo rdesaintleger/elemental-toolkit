@@ -19,6 +19,7 @@ package snapshotter_test
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -168,7 +169,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 
 		It("creates the very first snapshot", func() {
 			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
-			snap, err := backend.CreateNewSnapshot(rootDir, 0)
+			snap, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 0)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(snap.ID).To(Equal(1))
 			Expect(runner.MatchMilestones([][]string{
@@ -179,7 +180,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 		It("fails to create the first snapshot folder", func() {
 			cfg.Fs = vfs.NewReadOnlyFS(fs)
 			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
-			_, err := backend.CreateNewSnapshot(rootDir, 0)
+			_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 0)
 			Expect(err).To(HaveOccurred())
 			Expect(runner.MatchMilestones([][]string{
 				{"btrfs", "subvolume", "create"},
@@ -190,7 +191,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 			errMsg := "subvolume create failed"
 			sEffects = append(sEffects, &sideEffect{cmd: "btrfs subvolume create", errorMsg: errMsg})
 			backend := snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
-			_, err := backend.CreateNewSnapshot(rootDir, 0)
+			_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 0)
 			Expect(err).To(HaveOccurred())
 			Expect(runner.MatchMilestones([][]string{
 				{"btrfs", "subvolume", "create"},
@@ -293,7 +294,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 				var err error
 				BeforeEach(func() {
 					By("creates a new snapshot", func() {
-						snap, err = backend.CreateNewSnapshot(rootDir, 1)
+						snap, err = backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 						Expect(err).ToNot(HaveOccurred())
 						Expect(snap.ID).To(Equal(2))
 						Expect(runner.MatchMilestones([][]string{
@@ -384,7 +385,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 
 				// It does not detect any subvolume
 				sEffects = []*sideEffect{}
-				_, err := backend.CreateNewSnapshot(rootDir, 1)
+				_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 				Expect(err).To(HaveOccurred())
 				Expect(runner.MatchMilestones([][]string{
 					strings.Fields(listCmd),
@@ -393,7 +394,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 				// Fails to list subvolumes
 				runner.ClearCmds()
 				sEffects = []*sideEffect{{cmd: listCmd, errorMsg: errMsg}}
-				_, err = backend.CreateNewSnapshot(rootDir, 1)
+				_, err = backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 				Expect(err).To(HaveOccurred())
 				Expect(runner.MatchMilestones([][]string{
 					strings.Fields(listCmd),
@@ -407,7 +408,7 @@ var _ = Describe("btrfsBackend", Label("snapshotter", " btrfs"), func() {
 				errMsg := "failed create snapshot"
 				cSnapCmd := "btrfs subvolume snapshot"
 				sEffects = append(sEffects, &sideEffect{cmd: cSnapCmd, errorMsg: errMsg})
-				_, err := backend.CreateNewSnapshot(rootDir, 1)
+				_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 				Expect(err).To(HaveOccurred())
 				Expect(runner.MatchMilestones([][]string{
 					{"btrfs", "subvolume", "list"},

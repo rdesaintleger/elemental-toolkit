@@ -116,7 +116,7 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 			BeforeEach(func() {
 				By("creates the very first snapshot", func() {
 					backend = snapshotter.NewSubvolumeBackend(cfg, btrfsCfg, 4)
-					snap, err = backend.CreateNewSnapshot(rootDir, 0)
+					snap, err = backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 0)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(snap.ID).To(Equal(1))
 					Expect(runner.MatchMilestones([][]string{
@@ -143,9 +143,7 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 				Expect(err).To(Succeed())
 
 				Expect(runner.MatchMilestones([][]string{
-					{"btrfs", "property", "set"},
-					{"btrfs", "subvolume", "list"},
-					{"btrfs", "subvolume", "set-default", "259"},
+					{"snapper", "--no-dbus", "--root", rootDir, "modify"},
 				})).To(Succeed())
 			})
 		})
@@ -157,7 +155,7 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 			Expect(lst.ActiveID).To(Equal(0))
 			Expect(len(lst.IDs)).To(Equal(0))
 			Expect(runner.MatchMilestones([][]string{
-				{"snapper", "--no-dbus", "--root", "/some/root", "--csvout", "list"},
+				{"snapper", "--no-dbus", "--root", rootDir, "--csvout", "list"},
 			})).To(Succeed())
 		})
 
@@ -217,10 +215,10 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 				var snap *types.Snapshot
 				var err error
 				BeforeEach(func() {
-					createCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot create"
+					createCmd := "snapper --no-dbus --root /some/root create"
 					sEffects = append(sEffects, &sideEffect{cmd: createCmd, cmdOut: "2\n"})
 					By("creates a new snapshot", func() {
-						snap, err = backend.CreateNewSnapshot(rootDir, 1)
+						snap, err = backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 						Expect(err).ToNot(HaveOccurred())
 						Expect(snap.ID).To(Equal(2))
 						Expect(runner.MatchMilestones([][]string{
@@ -241,7 +239,7 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 				})
 
 				It("commits a snapshot", func() {
-					modifyCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot modify"
+					modifyCmd := "snapper --no-dbus --root /some/root modify"
 
 					err = backend.CommitSnapshot(rootDir, snap)
 					Expect(err).To(Succeed())
@@ -265,7 +263,7 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 				})
 
 				It("fails to set the snapshot as read-only", func() {
-					modifyCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot modify"
+					modifyCmd := "snapper --no-dbus --root /some/root modify"
 					errMsg := "failed setting read only property"
 					sEffects = append(sEffects, &sideEffect{cmd: modifyCmd, errorMsg: errMsg})
 
@@ -277,7 +275,7 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 				})
 
 				It("lists expected snapshots", func() {
-					listCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot --csvout list"
+					listCmd := "snapper --no-dbus --root /some/root --csvout list"
 					cmdOut := "0,no,no\n1,yes,yes\n"
 					sEffects = append(sEffects, &sideEffect{cmd: listCmd, cmdOut: cmdOut})
 
@@ -293,10 +291,10 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 			})
 
 			It("fails to determine a new ID while creating a new snapshot", func() {
-				createCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot create"
+				createCmd := "snapper --no-dbus --root /some/root create"
 				sEffects = append(sEffects, &sideEffect{cmd: createCmd, cmdOut: "wrong ID\n"})
 
-				_, err := backend.CreateNewSnapshot(rootDir, 1)
+				_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 				Expect(err).To(HaveOccurred())
 				Expect(runner.MatchMilestones([][]string{
 					strings.Fields(createCmd),
@@ -304,10 +302,10 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 			})
 
 			It("fails to create a new snapshot", func() {
-				createCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot create"
+				createCmd := "snapper --no-dbus --root /some/root create"
 				sEffects = append(sEffects, &sideEffect{cmd: createCmd, errorMsg: "some thing failed"})
 
-				_, err := backend.CreateNewSnapshot(rootDir, 1)
+				_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 				Expect(err).To(HaveOccurred())
 				Expect(runner.MatchMilestones([][]string{
 					strings.Fields(createCmd),
@@ -316,15 +314,15 @@ var _ = Describe("snapperBackend", Label("snapshotter", " btrfs"), func() {
 
 			It("fails to create the working area folder", func() {
 				cfg.Fs = vfs.NewReadOnlyFS(fs)
-				createCmd := "snapper --no-dbus --root /some/root/.snapshots/1/snapshot create"
+				createCmd := "snapper --no-dbus --root /some/root create"
 				sEffects = append(sEffects, &sideEffect{cmd: createCmd, cmdOut: "2\n"})
 
 				// Snapshot was already created when the error raises, hence it attempts to delete it
-				_, err := backend.CreateNewSnapshot(rootDir, 1)
+				_, err := backend.CreateNewSnapshot(rootDir, filepath.Join(rootDir, ".snapshots"), 1)
 				Expect(err).To(HaveOccurred())
 				Expect(runner.MatchMilestones([][]string{
 					strings.Fields(createCmd),
-					{"snapper", "--no-dbus", "--root", "/some/root/.snapshots/1/snapshot", "delete", "--sync", "2"},
+					{"snapper", "--no-dbus", "--root", "/some/root", "delete", "--sync", "2"},
 				})).To(Succeed())
 			})
 		})

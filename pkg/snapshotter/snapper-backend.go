@@ -70,10 +70,10 @@ func (s *snapperBackend) InitBrfsPartition(rootDir string) error {
 
 // CreateNewSnapshot creates a new snapshot based on the given baseID. In case basedID == 0, this method
 // assumes it will be creating the first snapshot.
-func (s snapperBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snapshot, error) {
+func (s snapperBackend) CreateNewSnapshot(rootDir string, snapshotsdDir string, baseID int) (*types.Snapshot, error) {
 	if baseID == 0 {
 		// Snapper does not support creating the very first empty snapshot yet
-		return s.btrfs.CreateNewSnapshot(rootDir, baseID)
+		return s.btrfs.CreateNewSnapshot(rootDir, snapshotsdDir, baseID)
 	}
 
 	s.cfg.Logger.Infof("Creating a new snapshot from %d", baseID)
@@ -95,14 +95,15 @@ func (s snapperBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Sn
 		return nil, err
 	}
 
-	workingDir := filepath.Join(rootDir, snapshotsPath, strconv.Itoa(newID), snapshotWorkDir)
+	snapshotsParent := filepath.Dir(snapshotsdDir)
+	workingDir := filepath.Join(snapshotsParent, snapshotsPath, strconv.Itoa(newID), snapshotWorkDir)
 	err = utils.MkdirAll(s.cfg.Fs, workingDir, constants.DirPerm)
 	if err != nil {
 		s.cfg.Logger.Errorf("failed creating the snapshot working directory: %v", err)
 		_ = s.DeleteSnapshot(rootDir, newID)
 		return nil, err
 	}
-	path := filepath.Join(rootDir, fmt.Sprintf(snapshotPathTmpl, newID))
+	path := filepath.Join(snapshotsParent, fmt.Sprintf(snapshotPathTmpl, newID))
 	return &types.Snapshot{
 		ID:      newID,
 		WorkDir: workingDir,
@@ -118,11 +119,6 @@ func (s snapperBackend) CommitSnapshot(rootDir string, snapshot *types.Snapshot)
 		return err
 	}
 
-	if s.activeID == 0 && s.currentID == 0 {
-		// Snapper does not support modifying a snapshot from a host not having a configured snapper
-		// and this is the case for the installation media
-		return s.btrfs.CommitSnapshot(rootDir, snapshot)
-	}
 	args := []string{
 		"modify", "--read-only", "--default", "--userdata",
 		fmt.Sprintf("%s=,%s=", installProgress, updateProgress), strconv.Itoa(snapshot.ID),
@@ -204,9 +200,7 @@ func (s snapperBackend) SnapshotsCleanup(rootDir string) error {
 // over the actual "/" root
 func (s snapperBackend) rootArgs(rootDir string) []string {
 	args := []string{}
-	if rootDir != "/" && s.currentID == 0 && s.activeID > 0 {
-		args = []string{"--no-dbus", "--root", filepath.Join(rootDir, fmt.Sprintf(snapshotPathTmpl, s.activeID))}
-	} else if rootDir != "/" {
+	if rootDir != "/" {
 		args = []string{"--no-dbus", "--root", rootDir}
 	}
 	return args

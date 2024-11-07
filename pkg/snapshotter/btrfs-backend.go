@@ -187,9 +187,10 @@ func (b *btrfsBackend) InitBrfsPartition(rootDir string) error {
 
 // CreateNewSnapshot creates a new snapshot based on the given baseID. In case basedID == 0, this method
 // assumes it will be creating the first snapshot.
-func (b btrfsBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snapshot, error) {
+func (b btrfsBackend) CreateNewSnapshot(rootDir string, snapshotsdDir string, baseID int) (*types.Snapshot, error) {
 	var workingDir string
 
+	snapshotsParent := filepath.Dir(snapshotsdDir)
 	newID, err := b.computeNewID(rootDir)
 	if err != nil {
 		b.cfg.Logger.Errorf("failed computing a new snapshotID: %v", err)
@@ -200,7 +201,7 @@ func (b btrfsBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snap
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(rootDir, fmt.Sprintf(snapshotPathTmpl, newID))
+	path := filepath.Join(snapshotsParent, fmt.Sprintf(snapshotPathTmpl, newID))
 
 	if baseID == 0 {
 		b.cfg.Logger.Debug("Creating first root filesystem as a snapshot")
@@ -224,7 +225,7 @@ func (b btrfsBackend) CreateNewSnapshot(rootDir string, baseID int) (*types.Snap
 			b.cfg.Logger.Errorf("failed creating first snapshot volume: %s", string(cmdOut))
 			return nil, err
 		}
-		workingDir = filepath.Join(rootDir, snapshotsPath, strconv.Itoa(newID), snapshotWorkDir)
+		workingDir = filepath.Join(snapshotsParent, snapshotsPath, strconv.Itoa(newID), snapshotWorkDir)
 		err = utils.MkdirAll(b.cfg.Fs, workingDir, constants.DirPerm)
 		if err != nil {
 			b.cfg.Logger.Errorf("failed creating the snapshot working directory: %v", err)
